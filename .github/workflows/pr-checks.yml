@@ -1,0 +1,41 @@
+name: PR Guideline Checks
+
+on:
+  pull_request:
+    types: [opened, reopened, edited]
+
+jobs:
+  pr-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: install PR check dependencies
+        run: |
+          pip install -r ${{ github.workspace }}/.github/workflows/requirements.txt
+
+      - name: Run PR checks
+        id: pr_checks
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_ID=$(echo $GITHUB_REF | cut -d/ -f3)
+          cd ${{ github.workspace }}
+          .github/workflows/pr-check ${{ github.repository }} $PR_ID > pr_checks.txt
+
+      - name: Post comment if checks didn't pass
+        uses: actions/github-script@v5
+        if: steps.pr_checks.outcome == 'failure'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs')
+            message = fs.readFileSync('pr_checks.txt', 'utf8')
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: message
+            })
+            core.setFailed("Some PR checks failed!")

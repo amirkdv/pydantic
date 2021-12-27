@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+import re
+import os
+import sys
+import json
+import argparse
+from typing import List, Optional
+
+import requests
+from github import Github
+from bs4 import BeautifulSoup
+from commonmark import commonmark
+
+
+class UnexpectedPRFormat(Exception):
+    pass
+
+
+def markdown_to_html_doc(body_md: str) -> BeautifulSoup:
+    body_html = commonmark(body_md)
+    return BeautifulSoup(body_html, 'html.parser')
+
+
+class PullRequest:
+    """A Github Pull Request.
+
+    Entrypoint to guideline check API:
+
+        check_X():  runs a specific check, returns an error string if any.
+        check():    runs all check_X() checks and returns a list of errors.
+    """
+    def __init__(self, gh: Github, repo: str, pr_id: int):
+        self.repo = gh.get_repo(repo)
+        self.pr = self.repo.get_pull(pr_id)
+        self.body = markdown_to_html_doc(self.pr.body)
+
+    def section_by_title(self, title: str) -> List[BeautifulSoup]:
+        """Extracts a "section" of the PR body by its title. A section is a
+        sequence of DOM siblings between any two consecutive headings.
+
+        For example, given:
+
+            ```md
+            # First Section
+
+            Hello World
+
+            # Second Section
+            ```
+
+        we would get:
+
+            >>> pr.section_by_title('First Section')
+            ['\n', <p>Hello World</p>]
+        """
+        headings = [
+            heading
+            for heading in self.body.select('h1,h2,h3,h4,h5,h6')
+            if heading.text.lower() == title.lower()
+        ]
+
+        if len(headings) != 1:
+            raise UnexpectedPRFormat("PR body should have a section titled '{}'.".format(title))
+
+        heading = headings[0]
+
+        elems = []
+        for elem in heading.next_siblings:
+            if not elem.name:
+                # text nodes
+                elems.append(elem)
+                continue
+
+            if re.match(r'h\d', elem.name):
+                # next heading
+                break
+            elems.append(elem)
+
+        return elems
+
+    def check_ids_in_title(self) -> Optional[str]:
+        """Checks that PR title does not include references to issues."""
+        match = re.search(r'#\d+', self.pr.title)
+        if match:
+            return "PR titles shouldn't contain issue IDs, found: '{}'.".format(match.group())
+
+        return None
+
+    def check_change_summary(self) -> Optional[str]:
+        """Checks that a Change Summary section exists."""
+        try:
+            self.section_by_title('Change Summary')
+        except UnexpectedPRFormat as e:
+            return str(e)
+
+        return None
+
+    def check_related_issue_ref(self) -> Optional[str]:
+        """If there are #N references in the 'Related issue number' section, at
+        least one uses a valid Github linking verb, eg fixes."""
+        # cf https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue
+        valid_issue_ref_verbs = [
+            'close', 'closes', 'closed',
+            'fix', 'fixes', 'fixed',
+            'resolve', 'resolves', 'resolved',
+        ]
+        try:
+            section = self.section_by_title('Related issue number')
+        except UnexpectedPRFormat as e:
+            return str(e)
+
+        text = ' '.join(e.text for e in section)
+        if not re.search(r'#\d+', text):
+            # ok to not reference anything
+            return None
+
+        # note: we don't actually check whether a #N reference is to an issue;
+        # it might be to another PR or to a discussion.
+        match = re.search(r'(\w+)\s+#(\d+)', text)
+        if not match:
+            return "Issue refs should use valid linking verbs like 'fixes #N'."
+
+        verb, issue_id = match.groups()
+        if verb not in valid_issue_ref_verbs:
+            return "Issue refs should use valid linking verbs like 'fixes #{}' not '{}'.".format(
+                issue_id, match.group()
+            )
+
+        return None
+
+    def check_checklist(self) -> Optional[str]:
+        """Checks that all tasks in the Checklist section are ticked off."""
+        try:
+            section = self.section_by_title('Checklist')
+        except UnexpectedPRFormat as e:
+            return str(e)
+
+        list_items = [
+            li.text.strip()
+            for elem in section if elem.name  # ignore leaf text nodes
+            for li in elem.find_all('li')
+        ]
+        n_incomplete_tasks = sum(1 for li in list_items if li.startswith('[ ]'))
+        if n_incomplete_tasks > 0:
+            return "Complete the remaining {} checklist task(s)".format(n_incomplete_tasks)
+
+        return None
+
+    def check(self) -> List[str]:
+        responses = [
+            self.check_ids_in_title(),
+            self.check_change_summary(),
+            self.check_related_issue_ref(),
+            self.check_checklist(),
+        ]
+        return [e for e in responses if e]
+
+
+def main(args: argparse.Namespace) -> int:
+    token = os.environ['GITHUB_TOKEN'].strip()
+    gh = Github(token)
+    pr = PullRequest(gh=gh, repo=args.repo, pr_id=args.pr_id)
+    errors = pr.check()
+    if not errors:
+        return 0
+
+    print('Thank you for opening a Pull Request!\n')
+    print('Before assigning it for review, please fix the following issue(s):\n')
+    print('- ' + '\n- '.join(errors))
+    return 1
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Runs checks against a PR description.")
+    parser.add_argument('repo', help="Name of the Github repository: [user]/[project]")
+    parser.add_argument('pr_id', type=int, help="Integer ID of the PR to check")
+    args = parser.parse_args()
+    sys.exit(main(args))
